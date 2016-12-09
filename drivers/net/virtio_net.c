@@ -330,6 +330,8 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 	return skb;
 }
 
+#define VIRTNET_REMOTE_PAGE 1
+
 static void virtnet_xdp_xmit(struct virtnet_info *vi,
 			     struct receive_queue *rq,
 			     struct send_queue *sq,
@@ -338,38 +340,41 @@ static void virtnet_xdp_xmit(struct virtnet_info *vi,
 	struct page *page = virt_to_head_page(xdp->data);
 	struct virtio_net_hdr_mrg_rxbuf *hdr;
 	unsigned int num_sg, len;
-	void *xdp_sent;
+	struct page *sent_page;
 	int err;
 
-	/* Free up any pending old buffers before queueing new ones. */
-	while ((xdp_sent = virtqueue_get_buf(sq->vq, &len)) != NULL) {
-		struct page *sent_page = virt_to_head_page(xdp_sent);
-
-		if (vi->mergeable_rx_bufs)
+	/* Free up any pending old buffers before queueing new ones. When the
+	 * page comes via remote xmit we do a put_page regardles of mode.
+	 */
+	while ((sent_page = virtqueue_get_buf(sq->vq, &len)) != NULL) {
+		if (sent_page->private)
+			put_page(sent_page);
+		else if (vi->mergeable_rx_bufs)
 			put_page(sent_page);
 		else
 			give_pages(rq, sent_page);
 	}
 
 	/* Zero header and leave csum up to XDP layers */
-	hdr = xdp->data;
+	hdr = xdp->data - (vi->hdr_len + (vi->mergeable_rx_bufs ? 0 : 4));
 	memset(hdr, 0, vi->hdr_len);
 
 	num_sg = 1;
-	sg_init_one(sq->sg, xdp->data, xdp->data_end - xdp->data);
+	sg_init_one(sq->sg, hdr, xdp->data_end - (void *)hdr);
 	err = virtqueue_add_outbuf(sq->vq, sq->sg, num_sg,
-				   xdp->data, GFP_ATOMIC);
+				   page, GFP_ATOMIC);
 	if (unlikely(err)) {
-		if (vi->mergeable_rx_bufs)
+		if (vi->mergeable_rx_bufs || !rq)
 			put_page(page);
 		else
 			give_pages(rq, page);
 		return; // On error abort to avoid unnecessary kick
-	} else if (!vi->mergeable_rx_bufs) {
+	} else if (!vi->mergeable_rx_bufs && rq) {
 		/* If not mergeable bufs must be big packets so cleanup pages */
 		give_pages(rq, (struct page *)page->private);
 		page->private = 0;
-	}
+	} else if (!rq)
+		page->private = VIRTNET_REMOTE_PAGE;
 
 	virtqueue_kick(sq->vq);
 }
@@ -384,6 +389,7 @@ static u32 do_xdp_prog(struct virtnet_info *vi,
 	unsigned int qp;
 	u32 act;
 	u8 *buf;
+	int err;
 
 	buf = page_address(page) + offset;
 
@@ -392,6 +398,7 @@ static u32 do_xdp_prog(struct virtnet_info *vi,
 	else
 		hdr_padded_len = sizeof(struct padded_vnet_hdr);
 
+	xdp.data_hard_start = buf;
 	xdp.data = buf + hdr_padded_len;
 	xdp.data_end = xdp.data + (len - vi->hdr_len);
 
@@ -403,11 +410,15 @@ static u32 do_xdp_prog(struct virtnet_info *vi,
 		qp = vi->curr_queue_pairs -
 			vi->xdp_queue_pairs +
 			smp_processor_id();
-		xdp.data = buf + (vi->mergeable_rx_bufs ? 0 : 4);
 		virtnet_xdp_xmit(vi, rq, &vi->sq[qp], &xdp);
 		return XDP_TX;
 	default:
 		bpf_warn_invalid_xdp_action(act);
+	case XDP_REDIRECT:
+		err = xdp_do_redirect(vi->dev, &xdp);
+		if (err)
+			return XDP_ABORTED;
+		return XDP_REDIRECT;
 	case XDP_ABORTED:
 	case XDP_DROP:
 		return XDP_DROP;
@@ -437,6 +448,7 @@ static struct sk_buff *receive_big(struct net_device *dev,
 	rcu_read_lock();
 	xdp_prog = rcu_dereference(rq->xdp_prog);
 	if (xdp_prog) {
+		struct page *page_list = (struct page *)page->private;
 		struct virtio_net_hdr_mrg_rxbuf *hdr = buf;
 		u32 act;
 
@@ -447,6 +459,10 @@ static struct sk_buff *receive_big(struct net_device *dev,
 		case XDP_PASS:
 			break;
 		case XDP_TX:
+			rcu_read_unlock();
+			goto xdp_xmit;
+		case XDP_REDIRECT:
+			give_pages(rq, page_list);
 			rcu_read_unlock();
 			goto xdp_xmit;
 		case XDP_DROP:
@@ -584,6 +600,7 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 			if (unlikely(xdp_page != page))
 				__free_pages(xdp_page, 0);
 			break;
+		case XDP_REDIRECT:
 		case XDP_TX:
 			if (unlikely(xdp_page != page))
 				goto err_xdp;
@@ -1756,6 +1773,26 @@ static int virtnet_xdp(struct net_device *dev, struct netdev_xdp *xdp)
 	}
 }
 
+static void virtnet_dev_xdp_xmit(struct net_device *dev, struct xdp_buff *xdp)
+{
+	struct virtnet_info *vi = netdev_priv(dev);
+	unsigned int qp = vi->curr_queue_pairs -
+			  vi->xdp_queue_pairs +
+			  smp_processor_id();
+	int hdr_len = vi->hdr_len + (vi->mergeable_rx_bufs ? 0 : 4);
+
+	/* virtio_net places descriptor in front of payload
+	 * in order to support this we need some room in front
+	 * of packet.
+	 */
+	if (xdp->data - xdp->data_hard_start < hdr_len) {
+		put_page(virt_to_head_page(xdp->data));
+		return;
+	}
+
+	virtnet_xdp_xmit(vi, NULL, &vi->sq[qp], xdp);
+}
+
 static const struct net_device_ops virtnet_netdev = {
 	.ndo_open            = virtnet_open,
 	.ndo_stop   	     = virtnet_close,
@@ -1773,6 +1810,7 @@ static const struct net_device_ops virtnet_netdev = {
 	.ndo_busy_poll		= virtnet_busy_poll,
 #endif
 	.ndo_xdp		= virtnet_xdp,
+	.ndo_xdp_xmit		= virtnet_dev_xdp_xmit,
 };
 
 static void virtnet_config_changed_work(struct work_struct *work)
@@ -1879,7 +1917,7 @@ static void free_unused_bufs(struct virtnet_info *vi)
 			if (!is_xdp_queue(vi, i))
 				dev_kfree_skb(buf);
 			else
-				put_page(virt_to_head_page(buf));
+				put_page(buf);
 		}
 	}
 
