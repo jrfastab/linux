@@ -12,6 +12,7 @@
 #include <linux/file.h>
 #include <linux/percpu.h>
 #include <linux/err.h>
+#include <linux/filter.h>
 
 struct perf_event;
 struct bpf_map;
@@ -225,6 +226,8 @@ typedef unsigned long (*bpf_ctx_copy_t)(void *dst, const void *src,
 
 u64 bpf_event_output(struct bpf_map *map, u64 flags, void *meta, u64 meta_size,
 		     void *ctx, u64 ctx_size, bpf_ctx_copy_t ctx_copy);
+
+int xdp_do_redirect(struct net_device *dev, struct xdp_buff *xdp);
 
 #ifdef CONFIG_BPF_SYSCALL
 DECLARE_PER_CPU(int, bpf_prog_active);
