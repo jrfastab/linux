@@ -379,12 +379,14 @@ static void virtnet_xdp_xmit(struct virtnet_info *vi,
 	virtqueue_kick(sq->vq);
 }
 
+#define VIRTIO_XDP_HEADROOM 256
+
 static u32 do_xdp_prog(struct virtnet_info *vi,
 		       struct receive_queue *rq,
 		       struct bpf_prog *xdp_prog,
 		       struct page *page, int offset, int len)
 {
-	int hdr_padded_len;
+	int hdr_padded_len, headroom;
 	struct xdp_buff xdp;
 	unsigned int qp;
 	u32 act;
@@ -393,12 +395,15 @@ static u32 do_xdp_prog(struct virtnet_info *vi,
 
 	buf = page_address(page) + offset;
 
-	if (vi->mergeable_rx_bufs)
+	if (vi->mergeable_rx_bufs) {
 		hdr_padded_len = sizeof(struct virtio_net_hdr_mrg_rxbuf);
-	else
+		headroom = VIRTIO_XDP_HEADROOM;
+	} else {
 		hdr_padded_len = sizeof(struct padded_vnet_hdr);
+		headroom = 0;
+	}
 
-	xdp.data_hard_start = buf;
+	xdp.data_hard_start = buf - VIRTIO_XDP_HEADROOM;
 	xdp.data = buf + hdr_padded_len;
 	xdp.data_end = xdp.data + (len - vi->hdr_len);
 
@@ -846,18 +851,22 @@ static int add_recvbuf_mergeable(struct receive_queue *rq, gfp_t gfp)
 	char *buf;
 	unsigned long ctx;
 	int err;
-	unsigned int len, hole;
+	unsigned int len, headroom = 0, hole;
+
+	if (rq->xdp_prog)
+		headroom = VIRTIO_XDP_HEADROOM;
 
 	len = get_mergeable_buf_len(&rq->mrg_avg_pkt_len);
-	if (unlikely(!skb_page_frag_refill(len, alloc_frag, gfp)))
+	if (unlikely(!skb_page_frag_refill(len + headroom, alloc_frag, gfp)))
 		return -ENOMEM;
 
 	buf = (char *)page_address(alloc_frag->page) + alloc_frag->offset;
+	buf += headroom; /* advance address leaving hole at front of pkt */
 	ctx = mergeable_buf_to_ctx(buf, len);
 	get_page(alloc_frag->page);
-	alloc_frag->offset += len;
+	alloc_frag->offset += len + headroom;
 	hole = alloc_frag->size - alloc_frag->offset;
-	if (hole < len) {
+	if (hole < len + headroom) {
 		/* To avoid internal fragmentation, if there is very likely not
 		 * enough space for another buffer, add the remaining space to
 		 * the current buffer. This extra space is not included in
